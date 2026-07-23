@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17.4-alpine
+    container_name: challenge-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: challengedb
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    container_name: challenge-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    networks:
+      - cache-network
+
+networks:
+  backend:
+    driver: bridge
+  cache-network:
+    driver: bridge
