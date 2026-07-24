@@ -50,7 +50,7 @@ export class ProductsService {
   }
 
   async searchProducts(query: string): Promise<Product[]> {
-    const cacheKey = 'product-search';
+    const cacheKey = `product-search:${query.toLowerCase()}`;
     const cached = await this.cacheManager.get<Product[]>(cacheKey);
     if (cached) {
       return cached;
