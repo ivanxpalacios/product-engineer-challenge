@@ -490,3 +490,129 @@ Respuesta verificada:
 ```json
 {"id":1,"status":"pending","total":"1999.98","user":{"id":1,"email":"ivan@test.com","name":"Ivan Test","isActive":true,"createdAt":"2026-07-24T05:32:06.987Z"},"userId":1,"items":[{"id":1,"orderId":1,"product":{"id":1,"name":"Laptop","description":null,"price":"999.99","stock":6,"isAvailable":true,"categoryId":1,"category":{"id":1,"name":"Electronics","description":null,"parentId":null},"createdAt":"2026-07-24T05:36:58.478Z","updatedAt":"2026-07-24T08:21:06.897Z"},"productId":1,"quantity":2,"price":"999.99"}],"createdAt":"2026-07-24T05:38:16.119Z"}
 ```
+
+## Bug #6: Sobreventa de stock por condición de carrera en `POST /orders`
+
+### Descripción
+
+Al crear una orden, `create()` en `orders.service.ts` seguía este patrón por
+cada producto del pedido:
+
+1. Leer el producto actual (`findOne`), incluyendo su `stock`.
+2. Comparar ese `stock` leído contra la cantidad pedida.
+3. Si alcanza, calcular `nuevoStock = stock - cantidad` y mandarlo a
+   `updateStock` — **sin `await`**, es decir, sin esperar a que esa
+   actualización terminara antes de seguir con el resto de la función.
+
+Esto tiene dos problemas que se combinan:
+
+- **Falta el `await`:** la respuesta de la orden podía devolverse antes de
+  que el descuento de stock terminara de guardarse en la base de datos.
+- **Condición de carrera real:** aunque se agregara el `await`, el problema
+  de fondo seguía existiendo. Dos requests que llegan casi al mismo tiempo
+  pueden ambas leer el mismo `stock` (por ejemplo, `6`) *antes* de que
+  cualquiera de las dos termine de escribir su actualización. Ambas pasan la
+  validación ("hay suficiente stock"), y ambas calculan `6 - cantidad` por
+  separado — la segunda escritura simplemente sobreescribe a la primera, en
+  vez de restar sobre el valor ya actualizado.
+
+Se comprobó disparando 5 órdenes concurrentes de `quantity: 2` sobre un
+producto con `stock: 6`: **las 5 se crearon exitosamente** (ninguna fue
+rechazada), y el stock final quedó en `4` — ni negativo ni correctamente
+restado 5 veces, sino el resultado de que varias escrituras se pisaran entre
+sí. Esto calza con el síntoma *"inconsistent or missing data"* de
+`INSTRUCTIONS.md`, y en un sistema real significaría vender más unidades de
+las que existen en inventario.
+
+### Código
+
+**Archivo:** `src/orders/orders.service.ts`, método `create` (dentro del `for`)
+y `src/products/products.service.ts` (nuevo método `decrementStock`)
+
+**Antes** (`orders.service.ts`):
+```ts
+const product = await this.productsService.findOne(itemDto.productId);
+
+if (product.stock < itemDto.quantity) {
+  throw new BadRequestException(`Not enough stock for ${product.name}`);
+}
+
+const orderItem = this.orderItemsRepository.create({
+  orderId: savedOrder.id,
+  productId: product.id,
+  quantity: itemDto.quantity,
+  price: product.price,
+});
+
+await this.orderItemsRepository.save(orderItem);
+total += product.price * itemDto.quantity;
+this.productsService.updateStock(product.id, product.stock - itemDto.quantity);
+```
+
+**Después** (`orders.service.ts`):
+```ts
+const product = await this.productsService.findOne(itemDto.productId);
+
+const decremented = await this.productsService.decrementStock(product.id, itemDto.quantity);
+if (!decremented) {
+  throw new BadRequestException(`Not enough stock for ${product.name}`);
+}
+
+const orderItem = this.orderItemsRepository.create({
+  orderId: savedOrder.id,
+  productId: product.id,
+  quantity: itemDto.quantity,
+  price: product.price,
+});
+
+await this.orderItemsRepository.save(orderItem);
+total += product.price * itemDto.quantity;
+```
+
+**Nuevo método** (`products.service.ts`, junto a `updateStock`):
+```ts
+async decrementStock(id: number, quantity: number): Promise<boolean> {
+  const result = await this.productsRepository
+    .createQueryBuilder()
+    .update(Product)
+    .set({ stock: () => 'stock - :quantity' })
+    .where('id = :id AND stock >= :quantity', { id, quantity })
+    .execute();
+
+  return (result.affected ?? 0) > 0;
+}
+```
+
+### Por qué es la mejor solución
+
+- **Causa raíz, no síntoma:** el problema no era solo el `await` faltante
+  (eso solo evitaba que la respuesta HTTP regresara antes de tiempo dentro de
+  una sola request) — era que "leer, comparar en código, y luego escribir"
+  son tres pasos separados, y entre esos pasos otra request puede colarse.
+  La solución mueve la comparación (`stock >= cantidad`) *dentro* de la
+  misma operación SQL que hace la resta (`stock = stock - cantidad WHERE
+  stock >= cantidad`), volviéndola una sola operación atómica: la base de
+  datos garantiza que ninguna otra escritura puede colarse entre "comparar" y
+  "restar", porque son la misma instrucción.
+- **`result.affected` como señal de éxito:** si la condición `stock >=
+  quantity` no se cumple al momento exacto de ejecutar el `UPDATE`, la fila
+  no se actualiza y `affected` es `0` — así sabemos que faltó stock sin
+  necesidad de leerlo primero y arriesgarnos a un valor obsoleto.
+- **No es un rediseño:** el contrato del endpoint no cambia (mismo request,
+  misma respuesta, mismo error `400 Not enough stock for X`); solo cambia
+  *cómo* se calcula y aplica el descuento de stock internamente. Es el mismo
+  tipo de cambio que el Bug #2 (reestructurar la implementación interna sin
+  tocar el contrato externo).
+- **Mínimo alcance:** no se tocó `updateStock` (que sigue usándose tal cual
+  en `cancel()`, donde reponer stock al cancelar una orden no tiene el mismo
+  riesgo de sobreventa), ni el DTO, ni el controlador.
+
+### Mediciones
+
+Con `stock: 6`, disparando 5 requests concurrentes de `{"productId":1,"quantity":2}`:
+
+| | Antes del fix | Después del fix |
+|---|---|---|
+| Órdenes aceptadas (201) | 5 de 5 | 2 de 5 |
+| Órdenes rechazadas (400 "Not enough stock") | 0 de 5 | 3 de 5 |
+| Stock final | `4` (incorrecto — debería haber rechazado al menos 2 pedidos) | `0` (correcto — exactamente 2×2 unidades vendidas, el resto rechazado) |

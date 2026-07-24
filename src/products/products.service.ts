@@ -44,6 +44,17 @@ export class ProductsService {
     return this.productsRepository.save(product);
   }
 
+  async decrementStock(id: number, quantity: number): Promise<boolean> {
+    const result = await this.productsRepository
+      .createQueryBuilder()
+      .update(Product)
+      .set({ stock: () => 'stock - :quantity' })
+      .where('id = :id AND stock >= :quantity', { id, quantity })
+      .execute();
+
+    return (result.affected ?? 0) > 0;
+  }
+
   async remove(id: number): Promise<void> {
     const product = await this.findOne(id);
     await this.productsRepository.remove(product);

@@ -72,21 +72,21 @@ export class OrdersService {
     let total = 0;
     for (const itemDto of createOrderDto.items) {
       const product = await this.productsService.findOne(itemDto.productId);
-      
-      if (product.stock < itemDto.quantity) {
+
+      const decremented = await this.productsService.decrementStock(product.id, itemDto.quantity);
+      if (!decremented) {
         throw new BadRequestException(`Not enough stock for ${product.name}`);
       }
-      
+
       const orderItem = this.orderItemsRepository.create({
         orderId: savedOrder.id,
         productId: product.id,
         quantity: itemDto.quantity,
         price: product.price,
       });
-      
+
       await this.orderItemsRepository.save(orderItem);
       total += product.price * itemDto.quantity;
-      this.productsService.updateStock(product.id, product.stock - itemDto.quantity);
     }
     
     savedOrder.total = total;
