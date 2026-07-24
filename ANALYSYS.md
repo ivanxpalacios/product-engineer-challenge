@@ -412,3 +412,81 @@ Medido con `curl` contra el servidor local:
 |---|---|---|
 | Crear usuario con email nuevo | `201`, usuario creado | `201`, usuario creado (sin cambios) |
 | Crear usuario con email ya existente | `500 Internal server error` (sin detalle) | `409 Conflict`, `{"message":"Email ivan@test.com is already in use","error":"Conflict","statusCode":409}` |
+
+## Bug #5: `GET /orders/:id/full` responde `500 Internal server error` por referencia circular
+
+### Descripción
+
+El endpoint `GET /orders/:id/full` debía devolver una orden con todos sus
+detalles anidados (usuario, items, producto de cada item y categoría del
+producto). Para lograrlo, el código construía un objeto `enriched` a partir
+de la orden y le asignaba `enriched.user.latestOrder = enriched`, es decir,
+el `user` embebido guardaba una referencia de vuelta a la propia orden que lo
+contiene. Acto seguido, el código intentaba `JSON.parse(JSON.stringify(enriched))`
+(un patrón usado para "aplanar" la entidad de TypeORM a un objeto plano).
+
+El problema es que `JSON.stringify` no puede serializar una estructura
+circular (`orden -> user -> latestOrder -> orden -> ...`), así que lanza
+`TypeError: Converting circular structure to JSON`. Como ese error no es
+manejado, cae al handler genérico de Nest y responde `500 Internal server
+error` sin ningún detalle — otro caso del síntoma *"some failures produce
+vague or misleading error messages"* de `INSTRUCTIONS.md`.
+
+Además, `latestOrder` no aparece en ningún otro lugar del código ni en el
+contrato documentado del endpoint (`README.md` solo describe "Get order with
+full details"), por lo que no cumplía ninguna función necesaria: era
+código sobrante que rompía la serialización sin aportar nada a la respuesta.
+
+### Código
+
+**Archivo:** `src/orders/orders.service.ts`, método `getOrderWithFullDetails`
+
+**Antes:**
+```ts
+const enriched: any = { ...order };
+enriched.user = { ...order.user };
+enriched.user.latestOrder = enriched;
+
+return JSON.parse(JSON.stringify(enriched));
+```
+
+**Después:**
+```ts
+const enriched: any = { ...order };
+enriched.user = { ...order.user };
+
+return JSON.parse(JSON.stringify(enriched));
+```
+
+### Por qué es la mejor solución
+
+- **Causa raíz, no síntoma:** el ciclo se crea en un solo punto exacto
+  (`enriched.user.latestOrder = enriched`), que además no tiene ningún
+  propósito documentado ni usado en el resto del código. Eliminar esa línea
+  quita la causa del ciclo sin tocar nada más de la lógica de armado de la
+  respuesta.
+- **No se atrapa el error con un `try/catch`:** se consideró envolver el
+  `JSON.stringify` en un `try/catch` para evitar el 500, pero eso solo
+  ocultaría el síntoma (seguiría sin poder serializar, y habría que decidir
+  qué responder en su lugar). Quitar la asignación circular resuelve el
+  problema de raíz y permite que la serialización funcione tal como se
+  pretendía.
+- **Mínimo alcance:** no toca `findOne`, las relaciones cargadas
+  (`user`, `items`, `items.product`, `items.product.category`), ni el
+  controlador; el endpoint sigue devolviendo exactamente la misma forma de
+  datos, solo sin el campo roto que nadie más usaba.
+
+### Mediciones
+
+Antes del fix: `GET /orders/1/full` → `500`, `{"statusCode":500,"message":"Internal server error"}`.
+
+Después del fix, medido con `curl -w "%{time_total}"` contra el servidor local:
+
+| Endpoint | Status | Tiempo |
+|---|---|---|
+| `GET /orders/1/full` | 200 | ~22 ms |
+
+Respuesta verificada:
+```json
+{"id":1,"status":"pending","total":"1999.98","user":{"id":1,"email":"ivan@test.com","name":"Ivan Test","isActive":true,"createdAt":"2026-07-24T05:32:06.987Z"},"userId":1,"items":[{"id":1,"orderId":1,"product":{"id":1,"name":"Laptop","description":null,"price":"999.99","stock":6,"isAvailable":true,"categoryId":1,"category":{"id":1,"name":"Electronics","description":null,"parentId":null},"createdAt":"2026-07-24T05:36:58.478Z","updatedAt":"2026-07-24T08:21:06.897Z"},"productId":1,"quantity":2,"price":"999.99"}],"createdAt":"2026-07-24T05:38:16.119Z"}
+```
