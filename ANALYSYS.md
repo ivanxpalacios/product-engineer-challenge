@@ -338,3 +338,77 @@ error (ni antes ni después del fix) — es un batch sin ítems que procesar, no
 entrada inválida, así que responder `201` con `results: []` es el comportamiento
 correcto; validar que `productIds` no esté vacío se consideró y se descartó por
 estar fuera del alcance de este bug.
+
+## Bug #4: `POST /users` responde `500 Internal server error` al crear un email duplicado
+
+### Descripción
+
+El campo `email` de `User` es `@Column({ unique: true })`, pero el método
+`create` de `UsersService` no manejaba el caso de violación de esa restricción:
+simplemente llamaba a `usersRepository.save(user)` y dejaba que cualquier error
+de la base de datos se propagara tal cual. Postgres rechaza el `INSERT` con un
+error de unique constraint (`code: '23505'`), que TypeORM re-lanza sin traducir,
+y como Nest no sabe qué hacer con una excepción no reconocida, cae al manejador
+genérico y responde `500 Internal server error` sin ningún detalle — calzando
+directamente con el síntoma *"some failures produce vague or misleading error
+messages"* de `INSTRUCTIONS.md`.
+
+### Código
+
+**Archivo:** `src/users/users.service.ts`, método `create`
+
+**Antes:**
+```ts
+async create(createUserDto: CreateUserDto): Promise<User> {
+  const user = this.usersRepository.create(createUserDto);
+  const saved = await this.usersRepository.save(user);
+  await this.cacheManager.del('users:all');
+  return saved;
+}
+```
+
+**Después:**
+```ts
+async create(createUserDto: CreateUserDto): Promise<User> {
+  const user = this.usersRepository.create(createUserDto);
+  try {
+    const saved = await this.usersRepository.save(user);
+    await this.cacheManager.del('users:all');
+    return saved;
+  } catch (error) {
+    if (error.code === '23505') {
+      throw new ConflictException(`Email ${createUserDto.email} is already in use`);
+    }
+    throw error;
+  }
+}
+```
+
+### Por qué es la mejor solución
+
+- **Causa raíz, no síntoma:** el problema no es la restricción `unique` (que es
+  correcta y debe mantenerse), sino que no había ninguna traducción de ese error
+  esperable de negocio a una respuesta HTTP significativa. Se captura
+  específicamente el código de Postgres para violación de unique constraint
+  (`23505`) y se traduce a una excepción de Nest; cualquier otro error
+  (`error.code` distinto) se vuelve a lanzar tal cual, sin enmascarar fallos
+  genuinamente inesperados.
+- **`ConflictException` (409) en vez de `BadRequestException` (400):** se
+  evaluó usar `BadRequestException` para mantener el mismo patrón que
+  `products.service.ts` y `orders.service.ts` (que solo usan `NotFoundException`
+  y `BadRequestException`), pero se decidió mantener `ConflictException` porque
+  es semánticamente más correcto: el body de la request es válido en sí mismo
+  (un email con formato correcto), el conflicto es con el *estado actual del
+  servidor* (ya existe un recurso con ese email), que es exactamente para lo
+  que existe el código 409 en HTTP.
+- **Mínimo alcance:** no toca `findOne`, `remove`, el controlador, el DTO, ni
+  la restricción `unique` de la entidad.
+
+### Mediciones
+
+Medido con `curl` contra el servidor local:
+
+| Caso | Antes | Después |
+|---|---|---|
+| Crear usuario con email nuevo | `201`, usuario creado | `201`, usuario creado (sin cambios) |
+| Crear usuario con email ya existente | `500 Internal server error` (sin detalle) | `409 Conflict`, `{"message":"Email ivan@test.com is already in use","error":"Conflict","statusCode":409}` |
