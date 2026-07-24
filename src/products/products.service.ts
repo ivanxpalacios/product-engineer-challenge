@@ -88,25 +88,42 @@ export class ProductsService {
 
   async getCategoryTree(categoryId: number): Promise<any> {
     const category = await this.findCategory(categoryId);
-    return this.buildCategoryTree(category);
-  }
-
-  private buildCategoryTree(category: Category): any {
     const tree: any = {
       id: category.id,
       name: category.name,
-      children: [],
+      children: await this.buildDescendants(category.id),
     };
 
     if (category.parentId) {
-      tree.parent = this.buildCategoryTree(category.parent);
-    }
-
-    if (category.children && category.children.length > 0) {
-      tree.children = category.children.map(child => this.buildCategoryTree(child));
+      tree.parent = await this.buildAncestors(category.parentId);
     }
 
     return tree;
+  }
+
+  private async buildDescendants(categoryId: number): Promise<any[]> {
+    const children = await this.categoriesRepository.find({ where: { parentId: categoryId } });
+    return Promise.all(
+      children.map(async child => ({
+        id: child.id,
+        name: child.name,
+        children: await this.buildDescendants(child.id),
+      })),
+    );
+  }
+
+  private async buildAncestors(categoryId: number): Promise<any> {
+    const category = await this.categoriesRepository.findOne({ where: { id: categoryId } });
+    if (!category) {
+      return null;
+    }
+
+    const node: any = { id: category.id, name: category.name };
+    if (category.parentId) {
+      node.parent = await this.buildAncestors(category.parentId);
+    }
+
+    return node;
   }
 
   async processProductBatch(productIds: number[]): Promise<{ success: boolean; processed: number }> {
