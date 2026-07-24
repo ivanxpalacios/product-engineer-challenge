@@ -616,3 +616,73 @@ Con `stock: 6`, disparando 5 requests concurrentes de `{"productId":1,"quantity"
 | Órdenes aceptadas (201) | 5 de 5 | 2 de 5 |
 | Órdenes rechazadas (400 "Not enough stock") | 0 de 5 | 3 de 5 |
 | Stock final | `4` (incorrecto — debería haber rechazado al menos 2 pedidos) | `0` (correcto — exactamente 2×2 unidades vendidas, el resto rechazado) |
+
+## Bug #7: Se puede "pagar" una orden ya cancelada (`processPayment` no valida el estado)
+
+### Descripción
+
+El endpoint `POST /orders/:id/pay` procesa el pago de una orden y, si es
+exitoso, cambia su estado a `confirmed`. El método `processPayment` nunca
+validaba en qué estado se encontraba la orden antes de hacer esto — a
+diferencia de `cancel()`, que sí verifica explícitamente que la orden esté en
+estado `pending` antes de cancelarla.
+
+Como consecuencia, una orden que ya estaba `cancelled` podía "pagarse" y
+volver a quedar como `confirmed`, como si nunca se hubiera cancelado. Esto
+calza con el síntoma *"inconsistent or missing data"* de `INSTRUCTIONS.md`:
+el estado de una orden dejaba de ser una fuente de verdad confiable, ya que
+podía revertirse por una vía que no estaba pensada para eso (pagar, no
+"reactivar").
+
+Se comprobó creando una orden nueva, cancelándola (`POST /orders/15/cancel`
+→ `status: "cancelled"`), y luego pagándola (`POST /orders/15/pay`) — antes
+del fix, esto cambiaba su estado a `confirmed` sin ningún error.
+
+### Código
+
+**Archivo:** `src/orders/orders.service.ts`, método `processPayment`
+
+**Antes:**
+```ts
+async processPayment(orderId: number): Promise<{ success: boolean; transactionId: string }> {
+  const order = await this.findOne(orderId);
+
+  let lastError: Error;
+  for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    ...
+```
+
+**Después:**
+```ts
+async processPayment(orderId: number): Promise<{ success: boolean; transactionId: string }> {
+  const order = await this.findOne(orderId);
+
+  if (order.status !== OrderStatus.PENDING) {
+    throw new BadRequestException('Only pending orders can be paid');
+  }
+
+  let lastError: Error;
+  for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    ...
+```
+
+### Por qué es la mejor solución
+
+- **Causa raíz, no síntoma:** faltaba una validación de estado antes de
+  ejecutar una transición de estado (`pending → confirmed`). Se agrega
+  exactamente esa validación, en el mismo lugar donde debía estar desde el
+  principio.
+- **Consistencia con el patrón ya existente:** `cancel()` ya usa esta misma
+  forma de validar (`if (order.status !== OrderStatus.PENDING) throw new
+  BadRequestException(...)`) para su propia transición de estado. Replicar
+  ese patrón exacto en `processPayment` mantiene el código consistente en vez
+  de introducir un mecanismo de validación distinto.
+- **Mínimo alcance:** no toca la lógica de reintentos de pago, `findOne`,
+  `cancel`, el controlador, ni ningún otro método.
+
+### Mediciones
+
+| Caso | Antes | Después |
+|---|---|---|
+| Pagar una orden `pending` | `201`, `status: "confirmed"` | `201`, `status: "confirmed"` (sin cambios) |
+| Pagar una orden `cancelled` | `201`, `status` vuelve a `"confirmed"` (incorrecto) | `400 Bad Request`, `{"message":"Only pending orders can be paid","error":"Bad Request","statusCode":400}` |

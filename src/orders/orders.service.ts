@@ -103,7 +103,11 @@ export class OrdersService {
 
   async processPayment(orderId: number): Promise<{ success: boolean; transactionId: string }> {
     const order = await this.findOne(orderId);
-    
+
+    if (order.status !== OrderStatus.PENDING) {
+      throw new BadRequestException('Only pending orders can be paid');
+    }
+
     let lastError: Error;
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
       try {
