@@ -135,8 +135,7 @@ export class OrdersService {
     }
     
     for (const item of order.items) {
-      const product = await this.productsService.findOne(item.productId);
-      await this.productsService.updateStock(product.id, product.stock + item.quantity);
+      await this.productsService.incrementStock(item.productId, item.quantity);
     }
     
     order.status = OrderStatus.CANCELLED;

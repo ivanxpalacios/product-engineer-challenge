@@ -55,6 +55,15 @@ export class ProductsService {
     return (result.affected ?? 0) > 0;
   }
 
+  async incrementStock(id: number, quantity: number): Promise<void> {
+    await this.productsRepository
+      .createQueryBuilder()
+      .update(Product)
+      .set({ stock: () => 'stock + :quantity' })
+      .where('id = :id', { id, quantity })
+      .execute();
+  }
+
   async remove(id: number): Promise<void> {
     const product = await this.findOne(id);
     await this.productsRepository.remove(product);
