@@ -23,7 +23,7 @@ const paymentService = {
 
 @Injectable()
 export class OrdersService {
-  private maxRetries = 1000;
+  private maxRetries = 5;
 
   constructor(
     @InjectRepository(Order)
@@ -120,7 +120,7 @@ export class OrdersService {
         }
       } catch (error) {
         lastError = error;
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 100 * 2 ** attempt));
       }
     }
     

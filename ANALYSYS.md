@@ -686,3 +686,164 @@ async processPayment(orderId: number): Promise<{ success: boolean; transactionId
 |---|---|---|
 | Pagar una orden `pending` | `201`, `status: "confirmed"` | `201`, `status: "confirmed"` (sin cambios) |
 | Pagar una orden `cancelled` | `201`, `status` vuelve a `"confirmed"` (incorrecto) | `400 Bad Request`, `{"message":"Only pending orders can be paid","error":"Bad Request","statusCode":400}` |
+
+## Bug #8: Reposición de stock inconsistente al cancelar órdenes concurrentemente (`cancel`)
+
+### Descripción
+
+Al cancelar una orden, `cancel()` repone el stock de cada producto de la
+orden con el mismo patrón leer-comparar-escribir que causaba la sobreventa
+del Bug #6, solo que en dirección contraria (sumar en vez de restar):
+
+1. Leer el producto (`findOne`), incluyendo su `stock` actual.
+2. Calcular `nuevoStock = stock + cantidad` en el código.
+3. Guardar ese valor con `updateStock` (que sobreescribe el `stock` con el
+   valor absoluto recibido).
+
+El mismo problema de fondo del Bug #6 aplica aquí: si dos cancelaciones de
+órdenes distintas que comparten un producto ocurren casi al mismo tiempo,
+ambas pueden leer el mismo `stock` antes de que cualquiera termine de
+escribir su actualización, y la segunda escritura sobreescribe a la primera
+en vez de sumarse a ella — se pierde una reposición de stock completa.
+
+Se comprobó creando dos órdenes de 1 unidad cada una sobre "Pants"
+(`stock: 3` → `stock: 1` tras las dos compras), y cancelándolas de forma
+concurrente.
+
+### Código
+
+**Archivo:** `src/orders/orders.service.ts`, método `cancel`, y
+`src/products/products.service.ts` (nuevo método `incrementStock`, simétrico
+a `decrementStock` del Bug #6)
+
+**Antes** (`orders.service.ts`):
+```ts
+for (const item of order.items) {
+  const product = await this.productsService.findOne(item.productId);
+  await this.productsService.updateStock(product.id, product.stock + item.quantity);
+}
+```
+
+**Después** (`orders.service.ts`):
+```ts
+for (const item of order.items) {
+  await this.productsService.incrementStock(item.productId, item.quantity);
+}
+```
+
+**Nuevo método** (`products.service.ts`, junto a `decrementStock`):
+```ts
+async incrementStock(id: number, quantity: number): Promise<void> {
+  await this.productsRepository
+    .createQueryBuilder()
+    .update(Product)
+    .set({ stock: () => 'stock + :quantity' })
+    .where('id = :id', { id, quantity })
+    .execute();
+}
+```
+
+### Por qué es la mejor solución
+
+- **Mismo mecanismo que el Bug #6, aplicado consistentemente:** en vez de
+  leer el stock en el código y luego escribir un valor absoluto calculado
+  ahí, la suma ocurre en una sola operación SQL (`stock = stock + cantidad`)
+  — la base de datos hace la suma directamente sobre el valor que tenga en
+  ese instante, sin importar cuántas otras escrituras concurrentes estén
+  ocurriendo.
+- **Ya no depende de una lectura previa:** se elimina el `findOne` que solo
+  se usaba para obtener `product.stock` (innecesario ahora, porque la resta
+  ya no se calcula en el código) — esto además simplifica el método, quita
+  una consulta de más por cada ítem.
+- **No es un rediseño:** el contrato de `cancel()` no cambia (mismo request,
+  misma respuesta); solo cambia cómo se aplica el incremento de stock
+  internamente, igual que en el Bug #6.
+- **Mínimo alcance:** no toca `updateStock` (que ya no se usa en ningún otro
+  lado del código tras este cambio, pero se deja intacto por si se necesita
+  fijar un valor absoluto en el futuro — eliminarlo sería tocar más código
+  del estrictamente necesario para este bug).
+
+### Mediciones
+
+Con `stock: 3` en "Pants": se crearon 2 órdenes de 1 unidad cada una
+(`stock` bajó correctamente a `1`), y se cancelaron ambas de forma
+concurrente.
+
+| | Resultado |
+|---|---|
+| Stock antes de cancelar | `1` |
+| Stock después de cancelar ambas concurrentemente | `3` (correcto — las dos reposiciones de 1 unidad se sumaron) |
+
+## Hardening preventivo: `maxRetries` sin límite razonable ni backoff en `processPayment`
+
+> **Nota:** a diferencia de los bugs anteriores, esto **no es un defecto
+> confirmado ni reproducible** con el comportamiento actual del sistema. Se
+> documenta aparte porque es un cambio de código real, pero no cumple el
+> criterio de "mediciones reales de un problema observado" que sí aplica a
+> los Bugs #1–#7.
+
+### Descripción
+
+`processPayment` reintenta el pago simulado hasta `maxRetries = 1000` veces,
+esperando una pausa fija de 100ms entre cada reintento fallido. El servicio
+de pago simulado (`paymentService.processPayment`) falla aleatoriamente solo
+un 10% de las veces, así que en la práctica casi nunca se necesita más de un
+reintento — se midieron 30 pagos consecutivos y ninguno encadenó más de un
+fallo (ver detalle en el chat de esta sesión).
+
+El riesgo no es el comportamiento actual, sino el diseño: si la tasa de
+fallo real del servicio de pagos subiera (como ocurre en incidentes reales de
+proveedores de pago), no hay ningún techo razonable ni espera creciente entre
+intentos que frene el impacto — cada request de pago podría quedar
+reintentando por mucho tiempo, y con muchas requests concurrentes en esa
+situación, el servidor podría acumular cientos de solicitudes "atascadas" a
+la vez, degradando el sistema completo en vez de solo esa orden puntual.
+
+### Código
+
+**Archivo:** `src/orders/orders.service.ts`
+
+**Antes:**
+```ts
+private maxRetries = 1000;
+...
+} catch (error) {
+  lastError = error;
+  await new Promise(resolve => setTimeout(resolve, 100));
+}
+```
+
+**Después:**
+```ts
+private maxRetries = 5;
+...
+} catch (error) {
+  lastError = error;
+  await new Promise(resolve => setTimeout(resolve, 100 * 2 ** attempt));
+}
+```
+
+### Por qué es un cambio razonable
+
+- **Límite acotado:** 5 intentos es suficiente margen para tolerar fallos
+  transitorios ocasionales (con 10% de fallo, la probabilidad de agotar los
+  5 intentos es `0.1^5` ≈ 0.001%), sin dejar la puerta abierta a reintentos
+  prácticamente ilimitados.
+- **Backoff exponencial (`100 * 2^intento`):** en vez de reintentar cada
+  100ms sin importar cuántas veces ya falló, la espera crece (100ms, 200ms,
+  400ms, 800ms, 1600ms) — un patrón estándar para no bombardear un servicio
+  externo que ya está fallando, y para acotar el tiempo total máximo de esta
+  operación a unos ~3.1 segundos en el peor caso, en vez de no tener techo.
+- **No cambia el comportamiento observable actual:** con la tasa de fallo
+  simulada de hoy (10%), este cambio no debería notarse en la práctica — los
+  pagos exitosos siguen tomando lo mismo (~130ms), y solo afecta al
+  escenario raro de fallos consecutivos.
+- **Mínimo alcance:** dos líneas cambiadas, sin tocar la validación de
+  estado, el resto de la lógica de `processPayment`, ni ningún otro método.
+
+### Mediciones
+
+Con el cambio aplicado, 12 pagos consecutivos (sobre productos con stock
+disponible) midieron entre 131ms y 142ms cada uno — sin diferencia
+observable respecto al comportamiento antes del cambio, confirmando que no
+se rompió el caso normal.
