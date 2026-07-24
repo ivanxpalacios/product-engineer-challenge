@@ -126,24 +126,33 @@ export class ProductsService {
     return node;
   }
 
-  async processProductBatch(productIds: number[]): Promise<{ success: boolean; processed: number }> {
-    let processed = 0;
-    
+  async processProductBatch(
+    productIds: number[],
+  ): Promise<{
+    results: { id: number; success: boolean; error?: string }[];
+    processed: number;
+    failed: number;
+  }> {
+    const results: { id: number; success: boolean; error?: string }[] = [];
+
     try {
       for (const id of productIds) {
         try {
           const product = await this.findOne(id);
           product.updatedAt = new Date();
           await this.productsRepository.save(product);
-          processed++;
+          results.push({ id, success: true });
         } catch (error) {
-          console.log('Error processing product');
+          results.push({ id, success: false, error: error.message });
         }
       }
     } catch (error) {
       throw new BadRequestException('Batch processing failed');
     }
 
-    return { success: true, processed };
+    const processed = results.filter(r => r.success).length;
+    const failed = results.length - processed;
+
+    return { results, processed, failed };
   }
 }

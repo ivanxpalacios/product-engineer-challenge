@@ -210,3 +210,131 @@ Respuesta verificada para `GET /categories/1/tree`:
 ```json
 {"id":1,"name":"Electronics","children":[{"id":4,"name":"Mobile Devices","children":[{"id":5,"name":"Apple","children":[]}]}]}
 ```
+
+## Bug #3: `processProductBatch` reporta éxito aunque todo haya fallado, con errores sin detalle
+
+### Descripción
+
+El endpoint `POST /products/batch` procesa una lista de `productIds`, actualizando
+su `updatedAt`. Tenía dos problemas de reporte de errores:
+
+1. Cada fallo individual (por ejemplo, un `id` que no existe) se atrapaba con un
+   `catch` interno que solo hacía `console.log('Error processing product')` — un
+   mensaje genérico, sin el `id` ni el error real, útil solo en la terminal del
+   servidor y nunca visible para quien llamó al endpoint.
+2. La respuesta devuelta era siempre `{ success: true, processed: N }`, sin
+   importar cuántos (o todos) los IDs hubieran fallado. Con
+   `productIds: [999, 1000]` (ambos inexistentes), el endpoint respondía
+   `{ success: true, processed: 0 }` — "éxito" total cuando en realidad no se
+   procesó nada.
+
+Esto calza directamente con el síntoma *"some failures produce vague or
+misleading error messages"* de `INSTRUCTIONS.md`.
+
+Adicionalmente, el `try/catch` que envolvía todo el `for` no era del todo código
+muerto (si `productIds` no fuera un array iterable, el `for...of` fallaría ahí y
+ese catch devolvía un `400` genérico), pero mezclaba dos responsabilidades
+distintas — validación de entrada vs. errores por ítem — en un solo mecanismo,
+lo que hacía el flujo confuso de leer.
+
+### Código
+
+**Archivo:** `src/products/products.service.ts`, método `processProductBatch`
+
+**Antes:**
+```ts
+async processProductBatch(productIds: number[]): Promise<{ success: boolean; processed: number }> {
+  let processed = 0;
+
+  try {
+    for (const id of productIds) {
+      try {
+        const product = await this.findOne(id);
+        product.updatedAt = new Date();
+        await this.productsRepository.save(product);
+        processed++;
+      } catch (error) {
+        console.log('Error processing product');
+      }
+    }
+  } catch (error) {
+    throw new BadRequestException('Batch processing failed');
+  }
+
+  return { success: true, processed };
+}
+```
+
+**Después:**
+```ts
+async processProductBatch(
+  productIds: number[],
+): Promise<{
+  results: { id: number; success: boolean; error?: string }[];
+  processed: number;
+  failed: number;
+}> {
+  const results: { id: number; success: boolean; error?: string }[] = [];
+
+  try {
+    for (const id of productIds) {
+      try {
+        const product = await this.findOne(id);
+        product.updatedAt = new Date();
+        await this.productsRepository.save(product);
+        results.push({ id, success: true });
+      } catch (error) {
+        results.push({ id, success: false, error: error.message });
+      }
+    }
+  } catch (error) {
+    throw new BadRequestException('Batch processing failed');
+  }
+
+  const processed = results.filter(r => r.success).length;
+  const failed = results.length - processed;
+
+  return { results, processed, failed };
+}
+```
+
+### Por qué es la mejor solución
+
+- **Cambio mínimo de estructura:** se conserva el mismo mecanismo de control
+  de flujo del código original (el `try/catch` externo sigue ahí, atrapando
+  casos como `productIds` no iterable y devolviendo `400`), para mantener el
+  diff lo más pequeño posible — se evaluó reemplazarlo por un guard explícito
+  (`if (!Array.isArray(...))`) pero se descartó para no ampliar el alcance del
+  cambio más allá del bug reportado.
+- **Reporte por ítem, no solo agregados:** en vez de solo contar fallos, cada
+  elemento de `productIds` genera una entrada en `results` con su `id` y si
+  tuvo éxito o no (y el error real si falló). Así el caller puede reconciliar
+  exactamente qué pasó con cada producto que envió — esta es la forma que
+  suelen usar APIs de batch en producción (Stripe, AWS Batch, mutaciones bulk
+  de GraphQL), en vez de devolver solo un conteo de éxitos y una lista aparte
+  de fallidos.
+- **`error.message` real en vez de un log genérico:** el detalle del error
+  ahora viaja en la respuesta HTTP, visible para quien llamó al endpoint, no
+  solo en un `console.log` que solo ve quien tiene acceso a los logs del
+  servidor.
+- **Cambio de forma de respuesta, no de comportamiento central:** sigue
+  procesando todos los IDs que pueda y reportando los que fallen, sin abortar
+  el batch completo por un solo error — se preserva la intención original de
+  "procesamiento parcial tolerante a fallos", solo se corrige cómo se reporta.
+
+### Mediciones
+
+Medido con `curl` contra el servidor local:
+
+| Caso | Body enviado | Status | `processed`/`failed` | Tiempo |
+|---|---|---|---|---|
+| Mezcla válidos/inválidos | `{"productIds":[1,4,999,1000]}` | 201 | `processed: 2`, `failed: 2` | ~28 ms |
+| Todos inválidos | `{"productIds":[999,1000]}` | 201 | `processed: 0`, `failed: 2` | ~3 ms |
+| Array vacío | `{"productIds":[]}` | 201 | `processed: 0`, `failed: 0`, `results: []` | ~2 ms |
+
+Antes del fix, los tres casos habrían devuelto `{ success: true, processed: N }`
+sin distinguir cuáles IDs fallaron ni por qué. El caso de array vacío no lanza
+error (ni antes ni después del fix) — es un batch sin ítems que procesar, no una
+entrada inválida, así que responder `201` con `results: []` es el comportamiento
+correcto; validar que `productIds` no esté vacío se consideró y se descartó por
+estar fuera del alcance de este bug.
